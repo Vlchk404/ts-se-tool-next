@@ -29,14 +29,15 @@ with both games.
 
 ## Requirements
 
-- **Python 3.10 or newer.** Tick "Add python.exe to PATH" in the python.org
+- **Python 3.8 or newer.** Tick "Add python.exe to PATH" in the python.org
   installer. Nothing else to install — the package uses the standard library
-  only. If `cryptography` happens to be installed it is used to read encrypted
-  saves faster, but it is not required.
+  only. Saves are decrypted with Windows' own AES (CNG), so speed does not
+  depend on any third-party package; an installed `cryptography` works too.
 - **Euro Truck Simulator 2 or American Truck Simulator 1.60.1.7+.** Older saves
   open as well, but 1.60.1.7 is what this was tested against.
-- The GUI targets Windows (Tkinter ships with Python). The command line runs
-  anywhere the game's profile folders are visible.
+- **Windows 7 or newer** — the GUI targets Windows, tested on Windows 10 and 11,
+  and display scaling (125%/150%) is handled. The command line runs anywhere the
+  game's profile folders are visible.
 
 ## Install
 
@@ -73,6 +74,7 @@ The same from a terminal, in the project folder:
     python -m ets2se edit "MyProfile/1" --money 5000000 --dry-run
     python -m ets2se backups MyProfile
     python -m ets2se restore <backup-folder> "MyProfile/1"
+    python -m ets2se doctor
 
 A save can be given as a full folder path, as `profile/save`, or by name alone
 when it is unambiguous.
@@ -120,12 +122,46 @@ If your folder lives somewhere unusual, point at it:
     set ETS2SE_DOCUMENTS=D:\path\to\Documents
     python -m ets2se list
 
+## Troubleshooting
+
+Start here:
+
+    python -m ets2se doctor
+
+It prints the Python version and bitness, the Windows version, which AES backend
+is in use, whether tkinter is present, and which game folders were found.
+
+- **The window says "not responding" and closes with a Windows error report.**
+  That is what happened before 1.2 on machines without `cryptography`: the save
+  was decrypted in pure Python on the UI thread, and Windows declared the program
+  hung. Decryption now goes through Windows' own AES and reading happens on a
+  worker thread, so the window stays alive. If the status bar reads
+  "AES: чистый Python", Windows CNG is unavailable for some reason — saves still
+  open, just more slowly.
+- **Double-clicking the launcher opens the Microsoft Store.** That is the Store's
+  Python stub: it sits on `PATH` and runs nothing. Install Python from python.org;
+  the launcher skips the stub when a real Python is present.
+- **Blurry or tiny text** on a laptop at 125%/150% scaling — the editor declares
+  itself DPI-aware, so nothing needs configuring.
+
+
 ## How it works
 
 The game writes `game.sii` encrypted (`ScsC`). The editor reads those files but
 writes **decrypted** ones: binary `BSII` stays binary, text `SiiNunit` stays
 text. The game loads all three variants itself — the unencrypted `profile.sii`,
 `controls.sii` and the game's own `def` files prove it.
+
+Decryption uses whatever the machine has, fastest first: Windows' own AES (CNG,
+`bcrypt.dll`, present since Vista and hardware-accelerated), then `cryptography`
+if it is installed, and only as a last resort a pure-Python implementation. That
+one is built on the four inverse T-tables and is ~57x faster than the textbook
+form, but still far slower than the first two. The status bar and
+`python -m ets2se doctor` both say which one is active.
+
+Reading a save — decryption plus parsing a file that reaches 7 MB and 20 000
+units — happens on a worker thread, so the window keeps answering and Windows
+never declares it hung. Writing and the backup copy do the same.
 
 Nothing else changes on write: every untouched field is written with the same
 bytes it was read as. Over a corpus of 72 real saves, decode → encode reproduces

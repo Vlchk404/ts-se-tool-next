@@ -8,6 +8,8 @@ backup box is unchecked.
 from __future__ import annotations
 
 import os
+import queue
+import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 
@@ -54,6 +56,9 @@ class App(tk.Tk):
         self.backup_paths: list[str] = []
         self.loaded: dict = {}
         self.profile_dir = ""
+        self._loading = False
+        self._writing = False
+        scale_fonts(self)
         self._build()
         self.refresh_tree()
     # ---------------------------------------------------------------- layout
@@ -100,6 +105,26 @@ class App(tk.Tk):
         self.log = tk.Text(right, height=8, wrap="word")
         self.log.pack(fill="both", expand=False, pady=(6, 0))
         self.log.configure(state="disabled")
+
+        strip = ttk.Frame(self)
+        strip.pack(fill="x", padx=6, pady=(0, 4))
+        self.status = ttk.Label(strip, text=self._idle_status(),
+                                foreground="#555")
+        self.status.pack(side="left")
+        self.progress = ttk.Progressbar(strip, mode="indeterminate", length=160)
+        # packed only while something is running
+
+    @staticmethod
+    def _idle_status() -> str:
+        from . import crypt
+
+        names = {
+            "windows-cng": "AES: Windows (быстро)",
+            "cryptography": "AES: cryptography (быстро)",
+            "python": "AES: чистый Python — большие сохранения читаются долго",
+        }
+        return "Готов. " + names.get(crypt.backend_name(), "")
+
     def _tab_main(self) -> None:
         f = ttk.Frame(self.tabs, padding=10)
         self.tabs.add(f, text="Основное")
@@ -273,24 +298,66 @@ class App(tk.Tk):
         prof, slot = self.slots[sel[0]]
         self.open_save(prof.path, slot.path)
 
+    # Reading a save means AES-decrypting and parsing a file that reaches ~7 MB
+    # and 20 000 units. On the main thread that stops Tk answering Windows, and
+    # after a few seconds Windows paints the window over, calls it "not
+    # responding" and offers to close it — which looks exactly like a crash.
+    # So the work happens on a worker thread and the window stays alive.
     def open_save(self, profile_dir: str, save_dir: str) -> None:
-        self.head.configure(text="Читаю %s ..." % save_dir)
-        self.configure(cursor="watch")
-        self.update_idletasks()
-        try:
-            self.save = SaveGame(save_dir)
-        except Exception as exc:
-            self.save = None
-            self.head.configure(text="Не открылось: %s" % save_dir)
-            messagebox.showerror("Не удалось прочитать сохранение", str(exc))
+        if self._loading or self._writing:
+            # A click during a long read would otherwise look like nothing
+            # happened at all.
+            self.note("Подождите: предыдущая операция ещё идёт.")
             return
-        finally:
-            self.configure(cursor="")
+        self._loading = True
         self.profile_dir = profile_dir
+        self.head.configure(text="Читаю %s ..." % os.path.basename(save_dir))
+        self.busy_start("Читаю сохранение — это может занять несколько секунд")
+        result: queue.Queue = queue.Queue(maxsize=1)
+
+        def work() -> None:
+            try:
+                result.put(("ok", SaveGame(save_dir)))
+            except BaseException as exc:  # noqa: BLE001 - reported in the UI
+                result.put(("err", exc))
+
+        threading.Thread(target=work, daemon=True,
+                         name="ets2se-load").start()
+        self.after(50, self._poll_load, result, save_dir)
+
+    def _poll_load(self, result: queue.Queue, save_dir: str) -> None:
+        try:
+            status, payload = result.get_nowait()
+        except queue.Empty:
+            self.after(50, self._poll_load, result, save_dir)
+            return
+        self._loading = False
+        self.busy_stop()
+        if status == "err":
+            self.save = None
+            self.head.configure(text="Не открылось: %s"
+                                     % os.path.basename(save_dir))
+            messagebox.showerror("Не удалось прочитать сохранение",
+                                 "%s\n\n%s" % (save_dir, payload))
+            return
+        self.save = payload
         self.fill_fields()
         self.fill_backups()
         self.fill_raw()
         self.note("Открыто: %s" % save_dir)
+
+    def busy_start(self, text: str) -> None:
+        self.status.configure(text=text)
+        self.progress.pack(side="right", padx=(6, 0))
+        self.progress.start(12)
+        self.configure(cursor="watch")
+
+    def busy_stop(self) -> None:
+        self.progress.stop()
+        self.progress.pack_forget()
+        self.status.configure(text=self._idle_status())
+        self.configure(cursor="")
+
     def fill_fields(self) -> None:
         s = self.save
         if s is None:
@@ -400,6 +467,8 @@ class App(tk.Tk):
         if s is None:
             messagebox.showinfo("Нет сохранения", "Сначала выберите сохранение.")
             return
+        if self._loading or self._writing:
+            return
         before = len(s.log)
         try:
             self._collect(s)
@@ -411,11 +480,34 @@ class App(tk.Tk):
             return
         for line in s.log[before:]:
             self.note("  " + line)
+        # Encoding a big save and copying the backup folder are slow enough to
+        # ghost the window on a slow disk, so they go to a worker thread too.
+        self._writing = True
+        self.busy_start("Записываю сохранение и делаю копию")
+        make_backup = self.backup_var.get()
+        result: queue.Queue = queue.Queue(maxsize=1)
+
+        def work() -> None:
+            try:
+                result.put(("ok", s.write(make_backup=make_backup)))
+            except BaseException as exc:  # noqa: BLE001 - reported in the UI
+                result.put(("err", exc))
+
+        threading.Thread(target=work, daemon=True, name="ets2se-write").start()
+        self.after(50, self._poll_write, result, s)
+
+    def _poll_write(self, result: queue.Queue, s: SaveGame) -> None:
         try:
-            backup = s.write(make_backup=self.backup_var.get())
-        except Exception as exc:
-            messagebox.showerror("Не удалось записать", str(exc))
+            status, payload = result.get_nowait()
+        except queue.Empty:
+            self.after(50, self._poll_write, result, s)
             return
+        self._writing = False
+        self.busy_stop()
+        if status == "err":
+            messagebox.showerror("Не удалось записать", str(payload))
+            return
+        backup = payload
         self.note("Записано: %s" % s.dir)
         if backup:
             self.note("Копия: %s" % backup)
@@ -424,6 +516,7 @@ class App(tk.Tk):
                                "Копия не делалась."))
         self.open_save(self.profile_dir, s.dir)
         self.refresh_tree()
+
 
     def _collect(self, s: SaveGame) -> None:
         old = self.loaded
@@ -511,7 +604,51 @@ class App(tk.Tk):
             var.set("6")
 
 
+def enable_dpi_awareness() -> None:
+    """Tell Windows this process scales itself.
+
+    Without it a 125%/150% desktop — the default on most laptops since Windows
+    10 — hands Tk a 96-DPI window and stretches the result, so the whole editor
+    looks blurred. Each call is tried in turn: per-monitor v2 (Windows 10 1703+),
+    per-monitor (8.1+), then system-wide (Vista+).
+    """
+    import sys
+
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes
+    except ImportError:
+        return
+    try:
+        # -4 = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(-4):
+            return
+    except (AttributeError, OSError):
+        pass
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor
+        return
+    except (AttributeError, OSError):
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except (AttributeError, OSError):
+        pass
+
+
+def scale_fonts(root: tk.Tk) -> None:
+    """Match Tk's own scaling to the desktop's, so text is sized right."""
+    try:
+        dpi = root.winfo_fpixels("1i")
+    except tk.TclError:
+        return
+    if dpi > 0:
+        root.tk.call("tk", "scaling", dpi / 72.0)
+
+
 def main() -> int:
+    enable_dpi_awareness()
     app = App()
     app.mainloop()
     return 0

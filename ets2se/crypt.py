@@ -34,15 +34,81 @@ class SiiFormatError(Exception):
     pass
 
 
-def _aes_cbc_decrypt(iv: bytes, data: bytes) -> bytes:
-    try:
-        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    except ImportError:
-        from .aes_fallback import aes_cbc_decrypt
+def _cng_decrypt(iv: bytes, data: bytes) -> bytes:
+    from . import wincrypt
 
-        return aes_cbc_decrypt(_KEY, iv, data)
+    return wincrypt.aes_cbc_decrypt(_KEY, iv, data)
+
+
+def _library_decrypt(iv: bytes, data: bytes) -> bytes:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
     dec = Cipher(algorithms.AES(_KEY), modes.CBC(iv)).decryptor()
     return dec.update(data) + dec.finalize()
+
+
+def _pure_decrypt(iv: bytes, data: bytes) -> bytes:
+    from .aes_fallback import aes_cbc_decrypt
+
+    return aes_cbc_decrypt(_KEY, iv, data)
+
+
+# Fastest first. Windows CNG is part of the OS, so on Windows the editor gets
+# hardware AES without anything to install; `cryptography` is used when it
+# happens to be there; the pure-Python form is the portable last resort.
+_BACKENDS = (
+    ("windows-cng", _cng_decrypt),
+    ("cryptography", _library_decrypt),
+    ("python", _pure_decrypt),
+)
+
+_chosen = None  # (name, function), decided on first use
+
+
+def _pick():
+    global _chosen
+    if _chosen is not None:
+        return _chosen
+    from . import wincrypt
+
+    for name, fn in _BACKENDS:
+        if name == "windows-cng" and not wincrypt.available():
+            continue
+        if name == "cryptography":
+            try:
+                import cryptography  # noqa: F401
+            except ImportError:
+                continue
+        _chosen = (name, fn)
+        return _chosen
+    _chosen = _BACKENDS[-1]
+    return _chosen
+
+
+def backend_name() -> str:
+    """Which AES implementation is in use: 'windows-cng' | 'cryptography' |
+    'python'. Handy in bug reports — the pure-Python one is ~2000x slower."""
+    return _pick()[0]
+
+
+def _aes_cbc_decrypt(iv: bytes, data: bytes) -> bytes:
+    global _chosen
+    name, fn = _pick()
+    try:
+        return fn(iv, data)
+    except Exception:
+        # A backend that fails at run time (locked-down CNG, a broken
+        # cryptography build) must not take the editor down with it.
+        for other_name, other_fn in _BACKENDS:
+            if other_name == name:
+                continue
+            try:
+                out = other_fn(iv, data)
+            except Exception:
+                continue
+            _chosen = (other_name, other_fn)
+            return out
+        raise
 
 
 def decrypt(raw: bytes) -> bytes:

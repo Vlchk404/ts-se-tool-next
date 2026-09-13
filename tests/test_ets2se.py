@@ -116,6 +116,26 @@ class TextCodec(unittest.TestCase):
 
 
 class Aes(unittest.TestCase):
+    # NIST SP 800-38A, F.2.6 CBC-AES256.Decrypt - so the fallback is checked
+    # even on a machine where `cryptography` is not installed.
+    KEY = bytes.fromhex("603deb1015ca71be2b73aef0857d7781"
+                        "1f352c073b6108d72d9810a30914dff4")
+    IV = bytes.fromhex("000102030405060708090a0b0c0d0e0f")
+    CIPHER = bytes.fromhex("f58c4c04d6e5f1ba779eabfb5f7bfbd6")
+    PLAIN = bytes.fromhex("6bc1bee22e409f96e93d7e117393172a")
+
+    def test_fallback_matches_known_vector(self):
+        from ets2se.aes_fallback import aes_cbc_decrypt
+        self.assertEqual(aes_cbc_decrypt(self.KEY, self.IV, self.CIPHER),
+                         self.PLAIN)
+
+    def test_windows_backend_matches_known_vector(self):
+        from ets2se import wincrypt
+        if not wincrypt.available():
+            self.skipTest("Windows CNG недоступен")
+        self.assertEqual(wincrypt.aes_cbc_decrypt(self.KEY, self.IV, self.CIPHER),
+                         self.PLAIN)
+
     def test_fallback_matches_library(self):
         try:
             from cryptography.hazmat.primitives.ciphers import (Cipher,
@@ -129,6 +149,52 @@ class Aes(unittest.TestCase):
         want = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
         self.assertEqual(aes_cbc_decrypt(key, iv, data),
                          want.update(data) + want.finalize())
+
+    def test_backends_agree_on_a_long_message(self):
+        """Every available backend must produce the same bytes: the editor
+        picks whichever is fastest at run time."""
+        import os as _os
+
+        from ets2se import crypt, wincrypt
+        from ets2se.aes_fallback import aes_cbc_decrypt
+        key, iv = _os.urandom(32), _os.urandom(16)
+        data = _os.urandom(16 * 200)
+        outs = {"python": aes_cbc_decrypt(key, iv, data)}
+        if wincrypt.available():
+            outs["windows-cng"] = wincrypt.aes_cbc_decrypt(key, iv, data)
+        try:
+            from cryptography.hazmat.primitives.ciphers import (Cipher,
+                                                                algorithms, modes)
+            d = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
+            outs["cryptography"] = d.update(data) + d.finalize()
+        except ImportError:
+            pass
+        self.assertEqual(len(set(outs.values())), 1,
+                         "бэкенды разошлись: %s" % ", ".join(sorted(outs)))
+        self.assertIn(crypt.backend_name(), outs)
+
+    def test_real_saves_decrypt_the_same_on_every_backend(self):
+        from ets2se import crypt, wincrypt
+        from ets2se.aes_fallback import aes_cbc_decrypt
+        if not wincrypt.available():
+            self.skipTest("Windows CNG недоступен")
+        checked = 0
+        for path in corpus():
+            raw = read(os.path.join(path, "game.sii"))
+            if raw[:4] != b"ScsC":
+                continue
+            iv = raw[36:52]
+            body = raw[crypt.HEADER_SIZE:]
+            body = body[:len(body) - len(body) % 16]
+            if not body or len(body) > 300000:   # keep the slow one bearable
+                continue
+            self.assertEqual(wincrypt.aes_cbc_decrypt(crypt._KEY, iv, body),
+                             aes_cbc_decrypt(crypt._KEY, iv, body), path)
+            checked += 1
+            if checked >= 5:
+                break
+        if not checked:
+            self.skipTest("нет зашифрованных сохранений подходящего размера")
 
 
 class Corpus(unittest.TestCase):

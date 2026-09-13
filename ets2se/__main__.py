@@ -199,6 +199,44 @@ def cmd_gui(args) -> int:
     return gui_main()
 
 
+def cmd_doctor(args) -> int:
+    """Everything worth knowing when the editor misbehaves on another machine."""
+    import platform
+
+    from . import crypt
+    from . import __version__
+
+    print("редактор:   %s" % __version__)
+    print("python:     %s (%s)" % (platform.python_version(),
+                                   platform.architecture()[0]))
+    print("система:    %s %s" % (platform.system(), platform.release()))
+    backend = crypt.backend_name()
+    speed = {
+        "windows-cng": "Windows CNG, аппаратный — быстро",
+        "cryptography": "библиотека cryptography — быстро",
+        "python": "чистый Python — медленно, большие сохранения читаются десятки секунд",
+    }.get(backend, "")
+    print("AES:        %s (%s)" % (backend, speed))
+    try:
+        import tkinter
+        root = tkinter.Tk()
+        root.withdraw()
+        print("tkinter:    есть, Tk %s" % root.tk.call("info", "patchlevel"))
+        root.destroy()
+    except Exception as exc:
+        print("tkinter:    НЕТ — окно не откроется (%s)" % exc)
+
+    dirs = game.find_game_dirs()
+    if not dirs:
+        print("папки игры: не найдены (задайте ETS2SE_DOCUMENTS)")
+    for gdir in dirs:
+        profs = game.list_profiles(gdir.path)
+        print("папки игры: %s — профилей %d, сохранений %d"
+              % (gdir.display_name, len(profs),
+                 sum(len(p.saves) for p in profs)))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ets2se",
@@ -208,6 +246,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("list", help="профили и сохранения").set_defaults(fn=cmd_list)
     sub.add_parser("gui", help="графическая оболочка").set_defaults(fn=cmd_gui)
+    sub.add_parser("doctor", help="проверка окружения: python, AES, tkinter, "
+                                  "папки игры").set_defaults(fn=cmd_doctor)
 
     show = sub.add_parser("show", help="что внутри сохранения")
     show.add_argument("save")

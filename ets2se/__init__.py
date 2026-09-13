@@ -16,7 +16,7 @@ from .model import Attr, SiiFile, Unit
 from .savegame import (SaveError, SaveGame, adr_levels, adr_mask, list_backups,
                        restore_backup, tree_roots)
 
-__version__ = "1.1"
+__version__ = "1.2"
 __all__ = [
     "SaveGame", "SaveError", "SaveSlot", "Profile", "GameDir",
     "SiiFile", "Unit", "Attr",
